@@ -1,0 +1,210 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "Creates a VPC with S3 endpoint, showing Lambda in VPC can reach S3 without internet access",
+    "Parameters" : {
+        "CidrAddress" : {
+            "Default" : "10.0",
+            "Description" : "Initial two values for CIDR address for the VPC, which will be expanded X.Y.0.0/16",
+            "Type" : "String",
+            "MinLength" : "3",
+            "MaxLength" : "7",
+            "AllowedPattern" : "[0-9]?[0-9]?[0-9]\\.[0-9]?[0-9]?[0-9]",
+            "ConstraintDescription" : "Must create a valid CIDR"
+        },
+        "PrivateSubnetCount" : {
+            "Default" : "3",
+            "Description" : "Number of private subnets to create in the VPC",
+            "Type" : "Number",
+            "AllowedValues" : ["2","3","4","5","6"],
+            "ConstraintDescription" : "Must be between 2 and 6"
+        },
+        "S3EndpointPrefixList" : {
+            "Description" : "The prefix list 'pl-xxxxxxx' value for S3 in the deployment region.  Use 'aws ec2 describe-prefix-lists'",
+            "Type" : "String"
+        },
+        "VPCTemplateURL" : {
+            "Description" : "The URL to the template to create the VPC (see https://github.com/gford1000-aws/vpc/blob/master/create_vpc.cform)",
+            "Type" : "String"
+        } 
+	},
+	"Resources" : {
+        "VPC" : {
+            "Type" : "AWS::CloudFormation::Stack",
+            "Properties" : {
+                "Parameters" : {
+                    "CidrAddress" : { "Ref" : "CidrAddress" },
+                    "CreatePublicSubnet" : "false",
+                    "EnableDnsSupport" : "true",
+                    "PrivateSubnetCount" : { "Ref" : "PrivateSubnetCount" }
+                },
+                "TemplateURL" : { "Ref" : "VPCTemplateURL" }
+            }
+        },
+        "S3Endpoint" : {
+            "Type" : "AWS::EC2::VPCEndpoint",
+            "Properties" : {
+                "PolicyDocument" : {
+                    "Version":"2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect" : "Allow",
+                            "Principal" : "*",
+                            "Action" : [ "s3:PutObject" ],
+                            "Resource": [ { "Fn::Sub": [ "${Arn}/*", { "Arn": { "Fn::GetAtt" : [ "Bucket", "Arn" ] } } ] } ] 
+                        }
+                    ]
+                },
+                "RouteTableIds" : [ { "Fn::GetAtt" : [ "VPC", "Outputs.PrivateSubnetRouteTable" ] } ],
+                "ServiceName" : { "Fn::Sub" : [ "com.amazonaws.${Region}.s3", { "Region" : { "Ref" : "AWS::Region" } } ] },
+                "VpcId" : { "Fn::GetAtt" : [ "VPC", "Outputs.VPC" ] }
+            }
+        },
+        "Bucket": {
+            "Type" : "AWS::S3::Bucket",
+            "Description" : "Bucket that Lambda will write to",
+            "Properties" : {
+                "AccessControl" : "Private"
+            }
+        },    
+        "LambdaS3Write" : {
+            "Type": "AWS::Lambda::Function",
+            "DependsOn" : "VPC",
+            "Properties" : {
+                "Code" : {
+                    "ZipFile" : {
+                        "Fn::Join": [
+                            "\n",
+                            [
+                                "import boto3",
+                                "import botocore.config",
+                                "import os",
+                                "from uuid import uuid4",
+                                "",
+                                "BUCKET_NAME = os.environ['BucketName']",
+                                "REGION_NAME = os.environ['RegionName']",
+                                "",
+                                "def lambda_handler(event, context):",
+                                "    # Using S3 VPC Endpoint requires 'path' style addressing, to avoid global url resolution",
+                                "    # Create client per: http://boto3.readthedocs.io/en/latest/guide/s3.html",
+                                "    client = boto3.client('s3', REGION_NAME, config=botocore.config.Config(s3={'addressing_style':'path'}))",
+                                "    resp = client.put_object(",
+                                "       Bucket=BUCKET_NAME,",
+                                "       Key=str(uuid4()),",
+                                "       Body=bytearray(\"Hello World\"))",
+                                "    print(resp)",
+                                ""
+                            ]
+                        ]
+                    }
+                },
+                "Description" : "Lambda demonstrating internet access, by writing to an S3 bucket",
+                "Environment" : {
+                    "Variables" : {
+                        "BucketName" : { "Ref": "Bucket" },
+                        "RegionName" : { "Ref": "AWS::Region" }
+                    }
+                },
+                "Handler" : "index.lambda_handler",
+                "MemorySize" : 128,
+                "Role" : { "Fn::GetAtt": [ "LambdaRole", "Arn" ] },
+                "Runtime" : "python2.7",
+                "Timeout" : 5,
+                "VpcConfig" : {
+                    "SecurityGroupIds" : [ { "Ref" : "LambdaSecurityGroup" }],
+                    "SubnetIds" : { "Fn::Split" : [ ",", { "Fn::GetAtt" : [ "VPC", "Outputs.PrivateSubnets" ] } ] }
+                }
+            }
+        },
+        "LambdaSecurityGroup" : {
+            "Type" : "AWS::EC2::SecurityGroup",
+            "Properties" : {
+                "GroupDescription" : "Security Group for Lambda Egress",
+                "VpcId" : { "Fn::GetAtt" : [ "VPC", "Outputs.VPC" ] },
+                "SecurityGroupEgress" : [
+                    {
+                        "DestinationPrefixListId" : { "Ref" : "S3EndpointPrefixList" },
+                        "IpProtocol" : "-1" 
+                    }
+                ]
+            }
+        },
+        "LambdaRole": {
+          "Type": "AWS::IAM::Role",
+          "Properties": {
+            "AssumeRolePolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                  },
+                  "Action": "sts:AssumeRole"
+                }
+              ]
+            },
+            "Path": "/",
+            "Policies": [
+              {
+                "PolicyName": "root",
+                "PolicyDocument": {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                      ],
+                      "Resource": "arn:aws:logs:*:*:*",
+                      "Effect": "Allow"
+                    },
+                    {
+                      "Effect" : "Allow",
+                      "Action" : [ 
+                        "s3:PutObject"
+                      ],
+                      "Resource": [ 
+                        {
+                          "Fn::Join" : [ "",
+                            [
+                              { "Fn::GetAtt" : [ "Bucket", "Arn" ] },
+                              "/*"
+                            ]
+                          ]
+                        } 
+                      ]
+                    },
+                    {
+                      "Effect":"Allow",
+                      "Action":[ 
+                        "ec2:CreateNetworkInterface",
+                        "ec2:DescribeNetworkInterfaces",
+                        "ec2:DeleteNetworkInterface"
+                      ],
+                      "Resource": [ 
+                        "*"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+    },
+    "Outputs" : {
+        "Bucket" : {
+            "Description" : "The name of the created bucket",
+            "Value" : { "Ref" : "Bucket" }
+        }, 
+        "Lambda" : {
+            "Description" : "The name of the lambda function",
+            "Value" : { "Ref" : "LambdaS3Write" }
+        },
+    	"VPC" : {
+    		"Description" : "VPC Name",
+    		"Value" : { "Ref" : "VPC" }
+    	}
+    }
+}
